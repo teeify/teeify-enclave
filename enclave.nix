@@ -1,40 +1,41 @@
 let
-  # 1. Pin Nixpkgs to a specific 2024 stable release
   nixpkgs-src = fetchTarball {
     url = "https://github.com/NixOS/nixpkgs/archive/nixos-24.11.tar.gz";
     sha256 = "1s2gr5rcyqvpr58vxdcb095mdhblij9bfzaximrva2243aal3dgx";
   };
   
-  # 2. Pin the Rust Overlay
   rust-overlay-src = fetchTarball {
     url = "https://github.com/oxalica/rust-overlay/archive/592e5dedf04f0eaff1ed0f01ce5db7407d9fc7be.tar.gz";
     sha256 = "014418sbd6ajfpzj7m8cckqy7ky0kcyha5w3fvilbppp8kq46pw5";
   };
 
   pkgs = import nixpkgs-src {
-    overlays = [ (import rust-overlay-src) ];
+    overlays =[ (import rust-overlay-src) ];
   };
 
-  # 3. Get the official AWS Nitro Enclave Kernel (bzImage)
-  # This version matches the CLI v1.4.4
   enclave-kernel = pkgs.fetchurl {
     url = "https://raw.githubusercontent.com/aws/aws-nitro-enclaves-cli/v1.4.4/blobs/x86_64/bzImage";
     sha256 = "sha256-IQ7adJwTCOtgZxpXnSTbXoo0d8t6JHzzE8KGsJ/i2Fc=";
   };
 
-  # 4. Define the exact Rust version
   rustToolchain = pkgs.rust-bin.stable."1.93.0".default.override {
     targets = [ "x86_64-unknown-linux-gnu" ];
   };
 
   lib = pkgs.lib;
+  
+  # 1. THE FIX: Using cleanSource securely ignores .git, and we block all docs/scripts.
   src_files = lib.cleanSourceWith {
-    src = ./.; 
+    src = lib.cleanSource ./.; 
     filter = path: type:
       let base = baseNameOf path; in
       !(
-        base == ".git" || base == "target" || base == "result" ||
-        lib.hasSuffix ".md" base || base == "bake.sh" || base == "repro.nix"
+        base == "target" || 
+        base == "result" ||
+        base == "teeify-agent.eif" ||
+        lib.hasSuffix ".md" base || 
+        lib.hasSuffix ".sh" base || 
+        lib.hasSuffix ".nix" base
       );
   };
 
@@ -46,11 +47,14 @@ let
     version = "1.0.0";
     src = src_files; 
     cargoLock = { lockFile = ./Cargo.lock; };
-    cargoBuildFlags = [ "-p" "teeify-enclave" ];
-    nativeBuildInputs = [ pkgs.pkg-config pkgs.cmake pkgs.go ];
+    cargoBuildFlags =[ "-p" "teeify-enclave" ];
+    nativeBuildInputs =[ pkgs.pkg-config pkgs.cmake pkgs.go ];
     buildInputs = [ pkgs.openssl ];
-    RUSTFLAGS = "-C target-cpu=x86-64 --remap-path-prefix ${./.}=/src -C link-arg=-Wl,--build-id=none";
+    
+    # 2. THE FIX: Use ${src_files} instead of ${./.}
+    RUSTFLAGS = "-C target-cpu=x86-64 --remap-path-prefix ${src_files}=/src -C link-arg=-Wl,--build-id=none";
     CARGO_INCREMENTAL = "0";
+    
     postInstall = ''
       ${pkgs.binutils}/bin/strip $out/bin/teeify-enclave
     '';
@@ -66,7 +70,7 @@ in
     config = {
       Cmd = [ "${teeify-bin}/bin/teeify-enclave" ];
       WorkingDir = "/";
-      Env = [
+      Env =[
         "AWS_REGION=eu-central-1"
         "TEEIFY_PARENT_VSOCK_CID=3"
         "AWS_EC2_METADATA_DISABLED=true"

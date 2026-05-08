@@ -35,4 +35,4 @@ chmod +x bake.sh
 Upon successful completion of the script, the Nitro CLI will output the enclave measurements. Compare the output to our live platform measurement:
 
 **Expected PCR0:** 
-`1e7793a5487ae66e02b8114b8d732326c378b4518bf83aca6549802af361d4281bfe54cbb0e48c14c8fe9644cc0dce93`
+`4ee769e57aa0af3a7317c8d480d00da52fb972250f09907c8fd0980c4bd8a3ccf8d6ce3bfbf4007e4ec404190ac73791`
