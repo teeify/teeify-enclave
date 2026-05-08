@@ -1,20 +1,25 @@
-# The Teeify Trust Protocol
+# 🔒 Teeify Enclave Engine
 
 This repository contains the source code for the **Teeify Enclave Engine**. 
 
-### Reproducible Builds
+Teeify is the orchestration layer for the autonomous economy. This specific repository holds the Rust-based Secure Compute Engine, which embeds a JavaScript runtime (`boa_engine`), a TLS-passthrough proxy, and AWS KMS integration directly into a hardware-isolated AWS Nitro Enclave.
+
+---
+
+## 🛡️ The Teeify Trust Protocol (Reproducible Builds)
+
 Teeify is built on mathematical proof, not human trust. You can verify the integrity of the platform by reproducing the **PCR0 hash** directly from this source code.
 
 To guarantee bit-for-bit determinism and eliminate hash drift caused by OS timestamps or compiler variations, Teeify utilizes a strict **Nix** build pipeline alongside `libfaketime`. 
 
-#### 1. Requirements
+### 1. Requirements
 To reproduce the build, we recommend using an Amazon Linux 2023 EC2 instance with the following installed:
--[Nix Package Manager](https://nixos.org/download)
+- [Nix Package Manager](https://nixos.org/download)
 - Docker
 - AWS Nitro Enclaves CLI (`aws-nitro-enclaves-cli`)
 - Faketime (`libfaketime` / `faketime`)
 
-#### 2. Build Command
+### 2. Build Command
 We have included the exact deterministic build script used in our production factory. Simply clone this repository and execute the bake script:
 
 ```bash
