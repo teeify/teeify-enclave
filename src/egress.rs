@@ -7,6 +7,7 @@
 use std::cell::RefCell;
 use std::io;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use boa_engine::error::{JsError, JsNativeError};
 use boa_engine::object::ObjectInitializer;
@@ -19,6 +20,7 @@ use rustls::ClientConfig;
 use rustls::RootCertStore;
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
 use url::Url;
 
 #[cfg(target_os = "linux")]
@@ -353,11 +355,15 @@ fn build_http_request(
     let host = url.host_str().unwrap_or("");
 
     let mut r = format!(
-        "{method} {request_path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: teeify-enclave/1\r\nConnection: close\r\n"
+        "{method} {request_path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: teeify-enclave/1\r\n"
     );
     for (k, v) in extra_headers {
+        if k.eq_ignore_ascii_case("connection") {
+            continue;
+        }
         r.push_str(&format!("{k}: {v}\r\n"));
     }
+    r.push_str("Connection: close\r\n");
     if let Some(b) = body {
         r.push_str(&format!("Content-Length: {}\r\n", b.len()));
     }
@@ -371,38 +377,110 @@ fn build_http_request(
 async fn read_response_capped(
     mut read: impl AsyncReadExt + Unpin,
 ) -> Result<Vec<u8>, boa_engine::error::JsError> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 16 * 1024];
-    loop {
-        let n = read.read(&mut chunk).await.map_err(|e| {
-            JsNativeError::error().with_message(format!("egress read: {e}"))
-        })?;
-        if n == 0 {
-            break;
+    let response_fut = async {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            match read.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if buf.len() + n > MAX_RESPONSE_BYTES {
+                        return Err(
+                            JsNativeError::error()
+                                .with_message("teeify.fetch: response exceeded size limit (4 MiB)")
+                                .into(),
+                        );
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    // Server closed TCP without TLS close_notify (common for CDNs). Treat as EOF.
+                    break;
+                }
+                Err(e) => {
+                    return Err(
+                        JsNativeError::error()
+                            .with_message(format!("egress read: {e}"))
+                            .into(),
+                    );
+                }
+            }
         }
-        if buf.len() + n > MAX_RESPONSE_BYTES {
-            return Err(
-                JsNativeError::error()
-                    .with_message("teeify.fetch: response exceeded size limit (4 MiB)")
-                    .into(),
-            );
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    Ok(buf)
+        Ok::<Vec<u8>, boa_engine::error::JsError>(buf)
+    };
+
+    timeout(Duration::from_secs(10), response_fut).await.map_err(|_| -> JsError {
+        JsNativeError::error()
+            .with_message("teeify.fetch: response read timed out (10s)")
+            .into()
+    })?
 }
 
-/// Return bytes after the first `\r\n\r\n` (end of HTTP headers). If not found, the full slice is
-/// returned.
-fn body_after_crlf_crlf(bytes: &[u8]) -> &[u8] {
-    const END_HEADERS: &[u8; 4] = b"\r\n\r\n";
-    if let Some(i) = bytes
-        .windows(END_HEADERS.len())
-        .position(|w| w == END_HEADERS)
-    {
-        &bytes[i + END_HEADERS.len()..]
+fn parse_http_response(bytes: &[u8]) -> Result<String, String> {
+    let crlf_crlf = b"\r\n\r\n";
+    let header_end = bytes
+        .windows(4)
+        .position(|w| w == crlf_crlf)
+        .ok_or_else(|| "Incomplete HTTP response (no header/body delimiter)".to_string())?;
+
+    let headers_str = String::from_utf8_lossy(&bytes[..header_end]);
+    let mut body = &bytes[header_end + 4..];
+
+    let is_chunked = headers_str
+        .to_lowercase()
+        .contains("transfer-encoding: chunked");
+
+    if is_chunked {
+        let mut dechunked = Vec::new();
+        loop {
+            if body.is_empty() {
+                return Err("Incomplete chunked encoding (unexpected EOF before size line)".to_string());
+            }
+            let Some(crlf_pos) = body.windows(2).position(|w| w == b"\r\n") else {
+                return Err("Incomplete chunked encoding (missing CRLF after size)".to_string());
+            };
+            let size_str = std::str::from_utf8(&body[..crlf_pos])
+                .map_err(|_| "Invalid UTF-8 in chunk-size line".to_string())?;
+            let size_token = size_str.split(';').next().unwrap_or("").trim();
+            let size = usize::from_str_radix(size_token, 16)
+                .map_err(|_| format!("Invalid chunk size: {:?}", size_token))?;
+
+            body = &body[crlf_pos + 2..];
+
+            if size == 0 {
+                break;
+            }
+
+            if body.len() < size + 2 {
+                return Err(format!(
+                    "Incomplete chunk body (need {} bytes incl. CRLF, have {})",
+                    size + 2,
+                    body.len()
+                ));
+            }
+
+            dechunked.extend_from_slice(&body[..size]);
+            if body.get(size..size + 2) != Some(&[b'\r', b'\n']) {
+                return Err("Malformed chunk framing (missing trailing CRLF)".to_string());
+            }
+            body = &body[size + 2..];
+        }
+
+        Ok(String::from_utf8_lossy(&dechunked).into_owned())
     } else {
-        bytes
+        Ok(String::from_utf8_lossy(body).into_owned())
+    }
+}
+
+/// After de-chunking: strip leading/trailing whitespace and NUL, then slice the outermost `{`/`}` or `[`/`]`.
+fn extract_json_boundary(payload: &str) -> Result<String, String> {
+    let trimmed = payload.trim_matches(|c: char| c.is_whitespace() || c == '\0');
+
+    let start = trimmed.find('{').or_else(|| trimmed.find('['));
+    let end = trimmed.rfind('}').or_else(|| trimmed.rfind(']'));
+    match (start, end) {
+        (Some(s), Some(e)) if e > s => Ok(trimmed[s..=e].to_string()),
+        _ => Err("Could not locate JSON boundaries in response body".to_string()),
     }
 }
 
@@ -431,8 +509,17 @@ async fn teeify_fetch(
         }
     };
 
-    let body = body_after_crlf_crlf(&bytes);
-    let s: String = String::from_utf8_lossy(body).into_owned();
-    let j = JsString::from(s);
-    Ok(JsValue::from(j))
+    let decoded_body = parse_http_response(&bytes).map_err(|e| -> JsError {
+        JsNativeError::error()
+            .with_message(format!("teeify.fetch HTTP decode error: {e}"))
+            .into()
+    })?;
+
+    let json_str = extract_json_boundary(&decoded_body).map_err(|e| -> JsError {
+        JsNativeError::error()
+            .with_message(format!("teeify.fetch JSON boundary error: {e}"))
+            .into()
+    })?;
+
+    Ok(JsValue::from(JsString::from(json_str)))
 }

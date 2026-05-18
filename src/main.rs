@@ -15,11 +15,13 @@ use aws_smithy_http_client::proxy::ProxyConfig;
 use aws_smithy_http_client::{Builder as AwsHttpClientBuilder, ConnectorBuilder, tls};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use boa_engine::builtins::promise::PromiseState;
+use boa_engine::error::JsNativeError;
+use boa_engine::object::builtins::{JsArrayBuffer, JsTypedArray};
 use boa_engine::object::ObjectInitializer;
 use boa_engine::property::Attribute;
-use boa_engine::{js_string, Context, JsResult, JsValue, NativeFunction, Source};
+use boa_engine::{js_string, Context, JsArgs, JsResult, JsValue, NativeFunction, Source};
 use k256::ecdsa::{SigningKey, VerifyingKey};
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
 use rsa::pkcs8::EncodePublicKey;
 use rsa::Oaep;
 use rsa::RsaPrivateKey;
@@ -27,6 +29,16 @@ use sha2::Sha256;
 use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+#[cfg(target_os = "linux")]
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+#[cfg(target_os = "linux")]
+use aws_sdk_kms::types::{KeyEncryptionMechanism, RecipientInfo as KmsRecipientInfo};
+#[cfg(target_os = "linux")]
+use rasn::ber;
+#[cfg(target_os = "linux")]
+use rasn::types::OctetString;
+#[cfg(target_os = "linux")]
+use rasn_cms::{ContentInfo, EnvelopedData, RecipientInfo as CmsRecipientInfo};
 
 #[cfg(target_os = "linux")]
 use aws_nitro_enclaves_nsm_api::{
@@ -66,6 +78,62 @@ fn register_console(context: &mut Context) -> JsResult<()> {
     );
     let obj = init.build();
     context.register_global_property(js_string!("console"), obj, Attribute::all())?;
+    Ok(())
+}
+
+/// Web Crypto–style [`getRandomValues`]: fills any `TypedArray` view (`Uint8Array`, etc.)
+/// via `OsRng` and returns the same object.
+fn crypto_get_random_values(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let typed_val = args.get_or_undefined(0);
+    let obj = typed_val.as_object().ok_or_else(|| {
+        JsNativeError::typ().with_message("crypto.getRandomValues: TypedArray is required")
+    })?;
+
+    let ta = JsTypedArray::from_object(obj.clone()).map_err(|_| {
+        JsNativeError::typ().with_message("crypto.getRandomValues: argument must be a TypedArray")
+    })?;
+
+    let len = ta.byte_length(context)?;
+    if len > 65_536 {
+        return Err(
+            JsNativeError::range().with_message("crypto.getRandomValues: TypedArray exceeds 65536 bytes")
+                .into(),
+        );
+    }
+
+    let buf_val = ta.buffer(context)?;
+    let buf_obj = buf_val.as_object().ok_or_else(|| {
+        JsNativeError::typ().with_message("crypto.getRandomValues: could not read ArrayBuffer")
+    })?;
+
+    let ab = JsArrayBuffer::from_object(buf_obj.clone())?;
+
+    let offset = ta.byte_offset(context)?;
+    let mut data =
+        ab.data_mut()
+            .ok_or_else(|| JsNativeError::typ().with_message("crypto.getRandomValues: ArrayBuffer is detached"))?;
+
+    let end = offset.checked_add(len).filter(|&e| e <= data.len()).ok_or_else(|| {
+        JsNativeError::typ().with_message("crypto.getRandomValues: TypedArray view out of bounds")
+    })?;
+
+    RngCore::fill_bytes(&mut OsRng, &mut data[offset..end]);
+    Ok(typed_val.clone())
+}
+
+fn register_crypto(context: &mut Context) -> JsResult<()> {
+    let mut init = ObjectInitializer::new(context);
+    init.function(
+        NativeFunction::from_fn_ptr(crypto_get_random_values),
+        js_string!("getRandomValues"),
+        1,
+    );
+    let obj = init.build();
+    context.register_global_property(js_string!("crypto"), obj, Attribute::all())?;
     Ok(())
 }
 
@@ -184,20 +252,114 @@ async fn kms_encrypt_plaintext(client: &KmsClient, key_id: &str, plaintext: &[u8
     Ok(STANDARD.encode(ct.as_ref()))
 }
 
+
+
 async fn kms_decrypt_plaintext(client: &KmsClient, encrypted_b64: &str) -> Result<Vec<u8>, String> {
-    let ct = STANDARD
-        .decode(encrypted_b64.trim())
-        .map_err(|e| format!("kms ciphertext base64: {e}"))?;
-    let out = client
-        .decrypt()
-        .ciphertext_blob(Blob::new(ct))
-        .send()
-        .await
-        .map_err(|e| format!("KMS decrypt (AES envelope): {e}"))?;
-    let pt = out
-        .plaintext
-        .ok_or_else(|| "KMS decrypt: missing plaintext".to_string())?;
-    Ok(Vec::from(pt.as_ref()))
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (client, encrypted_b64);
+        return Err("Attestation-based decryption is only available on Nitro hardware (Linux)".to_string());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let ct = STANDARD
+            .decode(encrypted_b64.trim())
+            .map_err(|e| format!("kms ciphertext base64: {e}"))?;
+
+        // 1. Export public key (SubjectPublicKeyInfo DER) for embedding in the attestation.
+        let rsa_pub_der = rsa_private_key()
+            .to_public_key()
+            .to_public_key_der()
+            .map_err(|e| format!("Failed to export RSA public key to DER: {e}"))?;
+
+        // 2. NSM attestation document containing our public key (required by KMS recipient policy).
+        let attestation_doc = {
+            let nsm_fd = nsm_init();
+            let request = Request::Attestation {
+                public_key: Some(ByteBuf::from(rsa_pub_der.as_bytes().to_vec())),
+                user_data: None,
+                nonce: None,
+            };
+            match nsm_process_request(nsm_fd, request) {
+                Response::Attestation { document } => document,
+                _ => return Err("NSM failed to generate attestation document".to_string()),
+            }
+        };
+
+        // 3. KMS recipient (Nitro); ciphertext_for_recipient is CMS EnvelopedData (often BER).
+        let recipient = KmsRecipientInfo::builder()
+            .attestation_document(Blob::new(attestation_doc))
+            .key_encryption_algorithm(KeyEncryptionMechanism::RsaesOaepSha256)
+            .build();
+
+        // 4. Decrypt with attestation — KMS returns CMS envelope encrypted to our attested RSA key.
+        let out = client
+            .decrypt()
+            .ciphertext_blob(Blob::new(ct))
+            .recipient(recipient)
+            .send()
+            .await
+            .map_err(|e| format!("KMS Attestation request failed: {e}"))?;
+
+        let encrypted_for_me = out
+            .ciphertext_for_recipient
+            .ok_or_else(|| "KMS missing ciphertext_for_recipient. Verify KMS Policy.".to_string())?;
+
+        // 5. Parse CMS ContentInfo → EnvelopedData (RFC 5652). KMS may emit BER with indefinite lengths.
+        let content_info: ContentInfo =
+            ber::decode(encrypted_for_me.as_ref()).map_err(|e| format!("CMS ContentInfo BER decode error: {e}"))?;
+        let enveloped: EnvelopedData = ber::decode(content_info.content.as_ref())
+                .map_err(|e| format!("CMS EnvelopedData BER decode error: {e}"))?;
+
+        // 6. Key transport: RSA-encrypted content-encryption key.
+        let ktri = enveloped
+            .recipient_infos
+            .into_iter()
+            .find_map(|ri| match ri {
+                CmsRecipientInfo::KeyTransRecipientInfo(kt) => Some(kt),
+                _ => None,
+            })
+            .ok_or_else(|| "CMS: expected KeyTransRecipientInfo".to_string())?;
+        let encrypted_aes_key = ktri.encrypted_key.as_ref();
+
+        // 7. Unwrap AES-256 CEK (RSAES-OAEP-SHA256, empty label).
+        let padding = Oaep::new::<Sha256>();
+        let aes_key = rsa_private_key()
+            .decrypt(padding, encrypted_aes_key)
+            .map_err(|e| format!("RSA decrypt of content key failed: {e}"))?;
+        let aes_key: [u8; 32] = aes_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| "RSA payload: expected 32-byte AES-256 key".to_string())?;
+
+        // 8. Encrypted payload + IV from EncryptedContentInfo.
+        let eci = enveloped.encrypted_content_info;
+        let mut pt_buffer = eci
+            .encrypted_content
+            .ok_or_else(|| "CMS missing encrypted content".to_string())?
+            .to_vec();
+
+        let params_any = eci
+            .content_encryption_algorithm
+            .parameters
+            .as_ref()
+            .ok_or_else(|| "CMS missing contentEncryptionAlgorithm parameters (IV)".to_string())?;
+        let iv_os: OctetString = ber::decode(params_any.as_bytes())
+            .map_err(|e| format!("CMS IV (OCTET STRING) decode error: {e}"))?;
+        let iv: [u8; 16] = iv_os
+            .as_ref()
+            .try_into()
+            .map_err(|_| "AES-CBC IV must be 16 bytes".to_string())?;
+
+        // 9. AES-256-CBC + PKCS#7.
+        type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
+        let pt = Aes256CbcDec::new(&aes_key.into(), &iv.into())
+            .decrypt_padded_mut::<Pkcs7>(&mut pt_buffer)
+            .map_err(|e| format!("AES-CBC payload decrypt failed: {e}"))?;
+
+        Ok(pt.to_vec())
+    }
 }
 
 async fn read_request_limited(stream: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
@@ -308,30 +470,21 @@ async fn kms_encrypt_signing_key(client: &KmsClient, key_id: &str, sk: &SigningK
 }
 
 async fn kms_decrypt_signing_key(client: &KmsClient, encrypted_b64: &str) -> Result<SigningKey, String> {
-    let ct = STANDARD
-        .decode(encrypted_b64.trim())
-        .map_err(|e| format!("encrypted_key_b64: base64 decode: {e}"))?;
-    let out = client
-        .decrypt()
-        .ciphertext_blob(Blob::new(ct))
-        .send()
-        .await
-        .map_err(|e| format!("KMS decrypt: {e}"))?;
-    let pt = out
-        .plaintext
-        .ok_or_else(|| "KMS decrypt: missing plaintext".to_string())?;
+    let pt = kms_decrypt_plaintext(client, encrypted_b64).await?;
     SigningKey::from_slice(pt.as_ref()).map_err(|e| format!("invalid decrypted key: {e}"))
 }
 
 /// Drains the job queue (`run_jobs` runs the internal event loop to completion) and, if the eval
 /// result is a `Promise` (e.g. from `teeify.fetch` / async), unwraps settled values for the
-/// response string. Stays on one thread: `Context` is never sent across `await`.
-fn string_from_eval_value(context: &mut Context, value: JsValue) -> String {
+/// response string. Yields between iterations so egress / microtasks can poll on Tokio (`Context`
+/// stays borrowed on this task only — use `tokio::task::LocalSet` + `spawn_local` for inbound connections).
+async fn string_from_eval_value(context: &mut Context, value: JsValue) -> String {
     let mut v = value;
     for i in 0..64 {
         if let Err(e) = context.run_jobs() {
             return format!("run_jobs: {e:?}");
         }
+        tokio::task::yield_now().await;
         if let Some(p) = v.as_promise() {
             match p.state() {
                 PromiseState::Fulfilled(next) => v = next,
@@ -687,12 +840,14 @@ async fn handle_client(mut stream: impl AsyncReadExt + AsyncWriteExt + Unpin) {
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    // Boa `Context` is not `Send`; keep it in a block and finish before any `.await` so
-    // `tokio::spawn` sees a `Send` future.
-    let execution_result = {
+    // Boa `Context` is !Send — keep resolver + `Context` in one async stretch on this task
+    // (`spawn_local` + `LocalSet` in `run()`).
+    let execution_result = async {
         let mut context = Context::default();
         if let Err(e) = egress::register_teeify(&mut context, &private_key) {
             format!("teeify init: {e:?}")
+        } else if let Err(e) = register_crypto(&mut context) {
+            format!("crypto init: {e:?}")
         } else if let Err(e) = register_console(&mut context) {
             format!("console init: {e:?}")
         } else {
@@ -721,7 +876,9 @@ async fn handle_client(mut stream: impl AsyncReadExt + AsyncWriteExt + Unpin) {
                                     println!("🔒 Enclave: Bound JS code hash (Keccak256) to hardware attestation.");
                                     println!("🔒 Enclave: Evaluating agent code (TEEIFY_SECRETS set before eval)");
                                     match context.eval(Source::from_bytes(agent_code.as_bytes())) {
-                                        Ok(res) => string_from_eval_value(&mut context, res),
+                                        Ok(res) => {
+                                            string_from_eval_value(&mut context, res).await
+                                        }
                                         Err(e) => format!("JS Execution Error: {e:?}"),
                                     }
                                 }
@@ -731,7 +888,8 @@ async fn handle_client(mut stream: impl AsyncReadExt + AsyncWriteExt + Unpin) {
                 }
             }
         }
-    };
+    }
+    .await;
 
     #[cfg(not(target_os = "linux"))]
     let attestation_b64 = String::from("mock_attestation_for_local_dev");
@@ -830,7 +988,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             _ => 0,
         };
         println!("🔒 Enclave: connection from host CID {cid}");
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             handle_client(stream).await;
         });
     }
@@ -843,7 +1001,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         let (stream, peer) = listener.accept().await?;
         println!("🔒 Enclave: connection from {peer}");
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             handle_client(stream).await;
         });
     }
@@ -856,5 +1014,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let _ = rsa_private_key();
     println!("🔒 Teeify Enclave: booting (Boa JS engine, E2EE RSA-2048 ready)...");
-    run().await
+    let local = tokio::task::LocalSet::new();
+    local.run_until(run()).await
 }

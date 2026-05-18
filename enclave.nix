@@ -75,6 +75,7 @@ in
         "TEEIFY_PARENT_VSOCK_CID=3"
         "AWS_EC2_METADATA_DISABLED=true"
         "TEEIFY_KMS_KEY_ID=arn:aws:kms:eu-central-1:668576491768:key/8fc614b5-c335-4611-b2f3-e6ccec4a7ec7"
+        "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
       ];
     };
   };
